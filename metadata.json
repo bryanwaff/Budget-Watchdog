@@ -1,0 +1,8 @@
+{
+  "name": "County Budget Watchdog",
+  "description": "An AI-powered transparency platform that turns complex 400-page Kenyan county budget PDFs into plain-language answers for ward residents.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
