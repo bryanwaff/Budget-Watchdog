@@ -222,9 +222,17 @@ async function startServer() {
         try {
           const fileRef = await getOrUploadGcsFile(genAI, bucketName, selectedGcsFile);
           contents = [
-            fileRef,
             {
-              text: `You are the "County Budget Watchdog", expert in public finance.
+              role: "user",
+              parts: [
+                {
+                  fileData: {
+                    fileUri: fileRef.uri,
+                    mimeType: fileRef.mimeType
+                  }
+                },
+                {
+                  text: `You are the "County Budget Watchdog", expert in public finance.
 You are currently analyzing the source document: ${selectedGcsFile} from GCS bucket ${bucketName}.
 Focus Ward: ${ward || "General Area"}
 
@@ -235,6 +243,8 @@ INSTRUCTIONS:
 4. Use the attached document to answer. If specific data is missing in the document, state: "That information is not available in the active source document."
 
 USER QUESTION: ${question}`
+                }
+              ]
             }
           ];
         } catch (gcsError: any) {
@@ -245,9 +255,17 @@ USER QUESTION: ${question}`
         try {
           const fileRef = await getOrUploadNairobiPdf(genAI);
           contents = [
-            fileRef,
             {
-              text: `You are the "Nairobi County Budget Watchdog", expert in Nairobi City County public finance.
+              role: "user",
+              parts: [
+                {
+                  fileData: {
+                    fileUri: fileRef.uri,
+                    mimeType: fileRef.mimeType
+                  }
+                },
+                {
+                  text: `You are the "Nairobi County Budget Watchdog", expert in Nairobi City County public finance.
 Focus Ward: ${ward || "General Nairobi"}
 
 INSTRUCTIONS:
@@ -257,6 +275,8 @@ INSTRUCTIONS:
 4. Use the attached NAIROBI CITY COUNTY SUPPLEMENTARY II EXPENDITURE AND REVENUE ESTIMATES FOR FY 2024-2025 PDF document context to answer. If specific data is missing in PDF, state "That information is not available in the Supplementary II estimates."
 
 USER QUESTION: ${question}`
+                }
+              ]
             }
           ];
         } catch (uploadError: any) {
@@ -311,8 +331,18 @@ INSTRUCTIONS:
         try {
           const fileRef = await getOrUploadGcsFile(genAI, bucketName, selectedGcsFile);
           contents = [
-            fileRef,
-            { text: promptText }
+            {
+              role: "user",
+              parts: [
+                {
+                  fileData: {
+                    fileUri: fileRef.uri,
+                    mimeType: fileRef.mimeType
+                  }
+                },
+                { text: promptText }
+              ]
+            }
           ];
         } catch (uploadError: any) {
           console.error("Failed to upload GCS file for SMS:", uploadError);
@@ -322,8 +352,18 @@ INSTRUCTIONS:
         try {
           const fileRef = await getOrUploadNairobiPdf(genAI);
           contents = [
-            fileRef,
-            { text: promptText }
+            {
+              role: "user",
+              parts: [
+                {
+                  fileData: {
+                    fileUri: fileRef.uri,
+                    mimeType: fileRef.mimeType
+                  }
+                },
+                { text: promptText }
+              ]
+            }
           ];
         } catch (uploadError: any) {
           console.error("Failed to upload Nairobi PDF for SMS:", uploadError);
