@@ -20,35 +20,19 @@ import {
 import { motion, AnimatePresence } from 'motion/react';
 import ReactMarkdown from 'react-markdown';
 import { cn } from './lib/utils';
-
-// Types
-interface BudgetMetadata {
-  county: string;
-  year: string;
-  total_estimate: string;
-  recurrent_expenditure: string;
-  development_expenditure: string;
-}
+import { COUNTIES, County, Ward, BudgetMetadata } from './data';
 
 interface Message {
   role: 'user' | 'assistant';
   content: string;
 }
 
-const WARDS = [
-  { id: 'kiunga', name: 'Kiunga', projects: ['Household Water Connections', 'Desalination Plant'] },
-  { id: 'faza', name: 'Faza', projects: ['Ice Plant Revival', 'Siyu Household Connections'] },
-  { id: 'witu', name: 'Witu', projects: ['Water Pan Construction', 'Flood Disaster Relief'] },
-  { id: 'hindi', name: 'Hindi', projects: ['Market Paving (Cabro)', 'Road Maintenance'] },
-  { id: 'mpeketoni', name: 'Mpeketoni', projects: ['Market Completion', 'Agriculture Field Day'] },
-  { id: 'shella', name: 'Shella', projects: ['Manda Yawi-Raskitau Water Project', 'Jetty Rehabilitation'] },
-];
-
 export default function App() {
+  const [selectedCounty, setSelectedCounty] = useState<County>(COUNTIES[0]);
   const [metadata, setMetadata] = useState<BudgetMetadata | null>(null);
-  const [selectedWard, setSelectedWard] = useState(WARDS[0]);
+  const [selectedWard, setSelectedWard] = useState<Ward>(COUNTIES[0].wards[0]);
   const [chatMessages, setChatMessages] = useState<Message[]>([
-    { role: 'assistant', content: 'Habari! I am your County Budget Watchdog. Ask me anything about the budget. For example: "How much was allocated to Witu Ward for water?"' }
+    { role: 'assistant', content: 'Habari! I am your Kenyan County Budget Watchdog. Ask me anything about the budget. For example: "How much was allocated to Witu Ward for water?"' }
   ]);
   const [userInput, setUserInput] = useState('');
   const [isTyping, setIsTyping] = useState(false);
@@ -60,12 +44,31 @@ export default function App() {
   const [bucketName, setBucketName] = useState('');
   const [isConnecting, setIsConnecting] = useState(false);
   const [connectionStatus, setConnectionStatus] = useState<'idle' | 'success' | 'error'>('idle');
+  const [gcsFiles, setGcsFiles] = useState<{ name: string; size: string; contentType: string; updated: string }[]>([]);
+  const [selectedGcsFile, setSelectedGcsFile] = useState<string>('');
 
   useEffect(() => {
-    fetch('/api/budget/metadata')
+    setMetadata(null);
+    fetch(`/api/budget/metadata?county=${selectedCounty.id}`)
       .then(res => res.json())
       .then(setMetadata);
-  }, []);
+  }, [selectedCounty]);
+
+  const handleCountyChange = (county: County) => {
+    setSelectedCounty(county);
+    setSelectedWard(county.wards[0]);
+    setSmsDigest('');
+    setChatMessages([
+      {
+        role: 'assistant',
+        content: `Habari! I am your ${county.name} Budget Watchdog. I now have the active budget context. Ask me anything! For example: ${
+          county.id === 'nairobi'
+            ? '"How much was allocated for infrastructure development in Kilimani?"'
+            : '"How much was allocated to Witu Ward for water?"'
+        }`
+      }
+    ]);
+  };
 
   const handleSendMessage = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -84,7 +87,9 @@ export default function App() {
           question: userInput, 
           ward: selectedWard.name,
           dataSource,
-          bucketName: dataSource === 'cloud-storage' ? bucketName : undefined
+          bucketName: dataSource === 'cloud-storage' ? bucketName : undefined,
+          county: selectedCounty.id,
+          selectedGcsFile: dataSource === 'cloud-storage' ? selectedGcsFile : undefined
         })
       });
       const data = await res.json();
@@ -106,8 +111,15 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ bucketName })
       });
-      if (res.ok) {
+      const data = await res.json();
+      if (res.ok && data.files) {
+        setGcsFiles(data.files);
         setConnectionStatus('success');
+        if (data.files.length > 0) {
+          setSelectedGcsFile(data.files[0].name);
+        } else {
+          setSelectedGcsFile('');
+        }
       } else {
         setConnectionStatus('error');
       }
@@ -124,10 +136,16 @@ export default function App() {
       const res = await fetch('/api/budget/sms-digest', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ward: selectedWard.name })
+        body: JSON.stringify({ 
+          county: selectedCounty.id, 
+          ward: selectedWard.name,
+          dataSource,
+          bucketName: dataSource === 'cloud-storage' ? bucketName : undefined,
+          selectedGcsFile: dataSource === 'cloud-storage' ? selectedGcsFile : undefined
+        })
       });
       const data = await res.json();
-      setSmsDigest(data.sms);
+      setSmsDigest(data.sms || data.error);
     } catch (err) {
       setSmsDigest("Failed to generate digest.");
     }
@@ -209,10 +227,53 @@ export default function App() {
                 <button 
                   onClick={handleConnectBucket}
                   disabled={isConnecting || !bucketName}
-                  className="w-full bg-blue-700 text-white py-2.5 rounded-lg text-xs font-bold hover:bg-blue-800 active:scale-[0.98] transition-all disabled:opacity-50 disabled:pointer-events-none shadow-sm"
+                  className="w-full bg-blue-700 text-white py-2.5 rounded-lg text-xs font-bold hover:bg-blue-800 active:scale-[0.98] transition-all disabled:opacity-50 disabled:pointer-events-none shadow-sm cursor-pointer"
                 >
                   {isConnecting ? 'Connecting...' : 'Synchronize Source'}
                 </button>
+
+                {connectionStatus === 'success' && (
+                  <motion.div 
+                    initial={{ opacity: 0, y: 10 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    className="mt-4 pt-3 border-t border-slate-200/60"
+                  >
+                    <span className="text-[10px] font-black text-slate-450 uppercase tracking-[0.15em] block mb-2">Source Documents ({gcsFiles.length})</span>
+                    {gcsFiles.length === 0 ? (
+                      <div className="p-2 border border-dashed border-slate-200 rounded-lg bg-orange-50 text-orange-850 text-[10px] leading-relaxed">
+                        No compatible files found (.pdf, .txt, .json). Add some files to your bucket.
+                      </div>
+                    ) : (
+                      <div className="space-y-1 max-h-48 overflow-y-auto pr-1">
+                        {gcsFiles.map((f) => {
+                          const isSelected = selectedGcsFile === f.name;
+                          return (
+                            <button
+                              key={f.name}
+                              onClick={() => setSelectedGcsFile(f.name)}
+                              className={cn(
+                                "w-full text-left p-2 rounded-lg border transition-all flex items-start gap-2.5 cursor-pointer group",
+                                isSelected 
+                                  ? "bg-blue-500 text-white border-blue-600 font-bold shadow-md animate-none"
+                                  : "bg-white border-slate-200/65 hover:border-slate-350 text-slate-705"
+                              )}
+                            >
+                              <FileText size={13} className={cn("mt-0.5 shrink-0 uppercase", isSelected ? "text-blue-100" : "text-slate-400 group-hover:text-slate-600")} />
+                              <div className="min-w-0 flex-1">
+                                <p className={cn("text-[11px] truncate leading-tight", isSelected ? "text-white" : "text-slate-900 font-semibold")} title={f.name}>
+                                  {f.name}
+                                </p>
+                                <p className={cn("text-[9px] font-medium mt-0.5", isSelected ? "text-blue-100" : "text-slate-400")}>
+                                  {f.size}
+                                </p>
+                              </div>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </motion.div>
+                )}
               </motion.div>
             )}
           </div>
@@ -220,14 +281,32 @@ export default function App() {
 
         <div className="px-6 pb-8 space-y-8">
           <section>
-            <label className="text-[10px] font-black text-slate-400 uppercase tracking-[0.2em] mb-4 block">Regional Scope</label>
+            <label className="text-[10px] font-black text-slate-400 uppercase tracking-[0.2em] mb-3 block">Regional Jurisdiction</label>
+            <div className="grid grid-cols-2 gap-2 bg-slate-100 p-1 rounded-xl border border-slate-200 shadow-inner mb-4">
+              {COUNTIES.map(c => (
+                <button
+                  key={c.id}
+                  onClick={() => handleCountyChange(c)}
+                  className={cn(
+                    "flex flex-col items-center justify-center py-2 px-2 rounded-lg text-center transition-all cursor-pointer",
+                    selectedCounty.id === c.id 
+                      ? "bg-white text-blue-700 shadow-sm font-extrabold border border-slate-200/50" 
+                      : "text-slate-550 hover:text-slate-800 font-bold"
+                  )}
+                >
+                  <span className="text-xs">{c.id === 'lamu' ? '🏝️' : '🏙️'}</span>
+                  <span className="text-[9px] leading-tight tracking-tight uppercase mt-0.5">{c.name.split(' ')[0]}</span>
+                </button>
+              ))}
+            </div>
+            
             <div className="flex items-center gap-3 bg-slate-50 p-4 rounded-2xl border border-slate-100 hover:border-blue-200 transition-colors cursor-default group">
               <div className="w-8 h-6 bg-slate-200 rounded border border-slate-300 flex items-center justify-center overflow-hidden shrink-0 group-hover:border-blue-400 transition-colors">
                 <img src="https://upload.wikimedia.org/wikipedia/commons/4/49/Flag_of_Kenya.svg" className="w-full h-full object-cover" alt="KE" />
               </div>
               <div>
                 <span className="font-bold text-sm text-slate-800">{metadata?.county || 'Loading...'} County</span>
-                <p className="text-[10px] font-medium text-slate-500">Resource Dashboard Active</p>
+                <p className="text-[10px] font-medium text-slate-500">{metadata ? `${metadata.year}` : 'Resource Dashboard'}</p>
               </div>
             </div>
           </section>
@@ -237,8 +316,8 @@ export default function App() {
             <div className="grid gap-3">
               <MetricCard label="Total Allocation" value={metadata?.total_estimate ? `${metadata.total_estimate}` : '...'} unit="KES" color="blue" />
               <div className="grid grid-cols-2 gap-3">
-                <MetricCard label="Operations" value="58%" unit="OF TOTAL" color="slate" />
-                <MetricCard label="Projects" value="42%" unit="OF TOTAL" color="green" />
+                <MetricCard label="Operations" value={metadata?.recurrent_percent || "58%"} unit="RECURRENT" color="slate" />
+                <MetricCard label="Projects" value={metadata?.development_percent || "42%"} unit="DEVELOPMENT" color="green" />
               </div>
             </div>
           </section>
@@ -277,10 +356,10 @@ export default function App() {
                </div>
                <select 
                  value={selectedWard.id}
-                 onChange={(e) => setSelectedWard(WARDS.find(w => w.id === e.target.value)!)}
+                 onChange={(e) => setSelectedWard(selectedCounty.wards.find(w => w.id === e.target.value)!)}
                  className="bg-transparent border-none focus:ring-0 text-slate-900 font-black text-xs cursor-pointer tracking-tight"
                >
-                 {WARDS.map(w => <option key={w.id} value={w.id}>{w.name} Ward</option>)}
+                 {selectedCounty.wards.map(w => <option key={w.id} value={w.id}>{w.name} Ward</option>)}
                </select>
             </div>
           </div>
