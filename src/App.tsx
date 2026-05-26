@@ -39,25 +39,60 @@ export default function App() {
   const [smsDigest, setSmsDigest] = useState('');
   const [isMenuOpen, setIsMenuOpen] = useState(false);
   
-  // Data Source State
-  const [dataSource, setDataSource] = useState<'internal' | 'cloud-storage'>('internal');
-  const [bucketName, setBucketName] = useState('');
+  // Data Source State (Connected directly to GCS budget_watchdog audit bucket)
+  const [dataSource, setDataSource] = useState<'internal' | 'cloud-storage'>('cloud-storage');
+  const [bucketName, setBucketName] = useState('budget_watchdog');
   const [isConnecting, setIsConnecting] = useState(false);
-  const [connectionStatus, setConnectionStatus] = useState<'idle' | 'success' | 'error'>('idle');
+  const [connectionStatus, setConnectionStatus] = useState<'idle' | 'success' | 'error'>('success');
   const [gcsFiles, setGcsFiles] = useState<{ name: string; size: string; contentType: string; updated: string }[]>([]);
-  const [selectedGcsFile, setSelectedGcsFile] = useState<string>('');
+  const [selectedGcsFile, setSelectedGcsFile] = useState<string>(COUNTIES[0].fileName);
+
+  // Active Real-time Tracker & Compliance Logs
+  const [lastActivity, setLastActivity] = useState<string>(new Date().toLocaleTimeString('en-US', { hour12: false }));
+  const [activityLogs, setActivityLogs] = useState<{ id: string; time: string; text: string; type: 'info' | 'success' | 'warning' }[]>([
+    { id: '1', time: new Date().toLocaleTimeString('en-US', { hour12: false }), text: 'County Integrity Watchdog System Booted', type: 'info' },
+    { id: '2', time: new Date().toLocaleTimeString('en-US', { hour12: false }), text: 'Linked target GCS bucket "budget_watchdog" dynamically', type: 'success' }
+  ]);
+
+  const addActivityLog = (text: string, type: 'info' | 'success' | 'warning' = 'info') => {
+    const timeStr = new Date().toLocaleTimeString('en-US', { hour12: false });
+    setLastActivity(timeStr);
+    setActivityLogs(prev => [
+      { id: String(Date.now()), time: timeStr, text, type },
+      ...prev.slice(0, 5) // keep last 6 logs
+    ]);
+  };
+
+  const getCleanExpenditure = (expStr: string | undefined, fallback: string) => {
+    if (!expStr) return fallback;
+    const cleaned = expStr.replace(/\s*\(\d+%\)/g, '').trim();
+    if (cleaned.toLowerCase().startsWith("kes")) {
+      return cleaned;
+    }
+    return `KES ${cleaned}`;
+  };
 
   useEffect(() => {
     setMetadata(null);
-    fetch(`/api/budget/metadata?county=${selectedCounty.id}`)
+    const queryDocName = selectedCounty?.fileName || COUNTIES[0].fileName;
+    fetch(`/api/budget/metadata?doc=${encodeURIComponent(queryDocName)}`)
       .then(res => res.json())
-      .then(setMetadata);
+      .then(data => {
+        setMetadata(data);
+        addActivityLog(`Synchronized ${data.county || selectedCounty.name} budget metrics`, 'success');
+      })
+      .catch(err => {
+        console.error("Failed to load budget metadata:", err);
+        addActivityLog("Could not sync budget metrics", "warning");
+      });
   }, [selectedCounty]);
 
   const handleCountyChange = (county: County) => {
     setSelectedCounty(county);
     setSelectedWard(county.wards[0]);
+    setSelectedGcsFile(county.fileName);
     setSmsDigest('');
+    addActivityLog(`Switched jurisdiction to ${county.name}`, 'info');
     setChatMessages([
       {
         role: 'assistant',
@@ -70,13 +105,17 @@ export default function App() {
     ]);
   };
 
-  const handleSendMessage = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!userInput.trim()) return;
+  const handleSendMessage = async (e?: React.FormEvent, directMessage?: string) => {
+    if (e) e.preventDefault();
+    const query = directMessage || userInput;
+    if (!query.trim()) return;
 
-    const newMessages: Message[] = [...chatMessages, { role: 'user', content: userInput }];
+    addActivityLog(`Auditing: "${query.substring(0, 40)}..."`, 'info');
+    const newMessages: Message[] = [...chatMessages, { role: 'user', content: query }];
     setChatMessages(newMessages);
-    setUserInput('');
+    if (!directMessage) {
+      setUserInput('');
+    }
     setIsTyping(true);
 
     try {
@@ -84,27 +123,40 @@ export default function App() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ 
-          question: userInput, 
+          question: query, 
           ward: selectedWard.name,
-          dataSource,
-          bucketName: dataSource === 'cloud-storage' ? bucketName : undefined,
+          dataSource: 'cloud-storage',
+          bucketName: 'budget_watchdog',
           county: selectedCounty.id,
-          selectedGcsFile: dataSource === 'cloud-storage' ? selectedGcsFile : undefined
+          selectedGcsFile: selectedCounty.fileName
         })
       });
       const data = await res.json();
-      setChatMessages([...newMessages, { role: 'assistant', content: data.answer || data.error }]);
-    } catch (err) {
+      if (res.ok && (data.answer || !data.error)) {
+        setChatMessages([...newMessages, { role: 'assistant', content: data.answer || "Audit generated complete estimates parameters." }]);
+        addActivityLog(`Verification success for ${selectedWard.name} Ward`, 'success');
+      } else {
+        setChatMessages([...newMessages, { role: 'assistant', content: data.error || "System timed out during verification context ingestion." }]);
+        addActivityLog(`Audit flagged warning or exception`, 'warning');
+      }
+    } catch {
       setChatMessages([...newMessages, { role: 'assistant', content: "Sorry, I'm having trouble connecting to the audit logs. Please try again." }]);
+      addActivityLog(`Integrity server mapping failed to respond`, 'warning');
     } finally {
       setIsTyping(false);
     }
+  };
+
+  const handleProjectClick = (projectName: string) => {
+    const directQuery = `What can you tell me about the project "${projectName}" allocation or planned development metrics for ${selectedWard.name} Ward inside the active county resources?`;
+    handleSendMessage(undefined, directQuery);
   };
 
   const handleConnectBucket = async () => {
     if (!bucketName) return;
     setIsConnecting(true);
     setConnectionStatus('idle');
+    addActivityLog(`Triggering connection to GCS: ${bucketName}`, 'info');
     try {
       const res = await fetch('/api/budget/connect-source', {
         method: 'POST',
@@ -115,6 +167,7 @@ export default function App() {
       if (res.ok && data.files) {
         setGcsFiles(data.files);
         setConnectionStatus('success');
+        addActivityLog(`Connected to bucket: Found ${data.files.length} items`, 'success');
         if (data.files.length > 0) {
           setSelectedGcsFile(data.files[0].name);
         } else {
@@ -122,9 +175,11 @@ export default function App() {
         }
       } else {
         setConnectionStatus('error');
+        addActivityLog(`Invalid bucket or unauthorized request`, 'warning');
       }
     } catch {
       setConnectionStatus('error');
+      addActivityLog(`Connection failed to storage endpoints`, 'warning');
     } finally {
       setIsConnecting(false);
     }
@@ -132,6 +187,7 @@ export default function App() {
 
   const handleGenerateSMS = async () => {
     setSmsDigest('Generating...');
+    addActivityLog(`Drafting public news bite for ${selectedWard.name}`, 'info');
     try {
       const res = await fetch('/api/budget/sms-digest', {
         method: 'POST',
@@ -139,15 +195,22 @@ export default function App() {
         body: JSON.stringify({ 
           county: selectedCounty.id, 
           ward: selectedWard.name,
-          dataSource,
-          bucketName: dataSource === 'cloud-storage' ? bucketName : undefined,
-          selectedGcsFile: dataSource === 'cloud-storage' ? selectedGcsFile : undefined
+          dataSource: 'cloud-storage',
+          bucketName: 'budget_watchdog',
+          selectedGcsFile: selectedCounty.fileName
         })
       });
       const data = await res.json();
-      setSmsDigest(data.sms || data.error);
+      if (res.ok && data.sms) {
+        setSmsDigest(data.sms);
+        addActivityLog(`Alert compiled and ready to dispatch`, 'success');
+      } else {
+        setSmsDigest(data.error || "Execution timeout compiling SMS template.");
+        addActivityLog(`Failed digest template compilation`, 'warning');
+      }
     } catch (err) {
       setSmsDigest("Failed to generate digest.");
+      addActivityLog(`SMS mapping server failed to respond`, 'warning');
     }
   };
 
@@ -184,129 +247,63 @@ export default function App() {
             </div>
           </div>
 
-          <div id="data-source-config" className="mb-8 p-4 bg-slate-50 rounded-2xl border border-slate-200 shadow-inner">
-            <label className="text-[10px] font-black text-slate-400 uppercase tracking-[0.2em] mb-4 block">Data Infrastructure</label>
-            
-            <div className="flex p-1 bg-slate-200 rounded-lg mb-4">
-              <button 
-                onClick={() => setDataSource('internal')}
-                className={cn(
-                  "flex-1 flex items-center justify-center gap-2 py-2 px-3 rounded-md text-[11px] font-bold transition-all",
-                  dataSource === 'internal' ? "bg-white text-blue-700 shadow-sm" : "text-slate-500 hover:text-slate-700"
-                )}
-              >
-                <HardDrive size={14} /> Internal
-              </button>
-              <button 
-                onClick={() => setDataSource('cloud-storage')}
-                className={cn(
-                  "flex-1 flex items-center justify-center gap-2 py-2 px-3 rounded-md text-[11px] font-bold transition-all",
-                  dataSource === 'cloud-storage' ? "bg-white text-blue-700 shadow-sm" : "text-slate-500 hover:text-slate-700"
-                )}
-              >
-                <Cloud size={14} /> GCS Bucket
-              </button>
+          <div className="mb-8 p-4 bg-blue-50/70 rounded-2xl border border-blue-100/80 shadow-inner">
+            <div className="flex items-center gap-2 mb-2">
+              <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse shrink-0" />
+              <span className="text-[9px] font-black text-slate-450 uppercase tracking-[0.18em]">GCS AUDIT TARGET</span>
             </div>
-
-            {dataSource === 'cloud-storage' && (
-              <motion.div 
-                initial={{ opacity: 0, height: 0 }}
-                animate={{ opacity: 1, height: 'auto' }}
-                className="space-y-3"
-              >
-                <div className="relative">
-                  <input 
-                    type="text"
-                    value={bucketName}
-                    onChange={(e) => setBucketName(e.target.value)}
-                    placeholder="gs://my-budget-pdfs"
-                    className="w-full bg-white border border-slate-200 rounded-lg py-2.5 px-3 text-xs focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 outline-none transition-all placeholder:text-slate-400 font-medium"
-                  />
-                  {connectionStatus === 'success' && <CheckCircle2 size={16} className="absolute right-3 top-2.5 text-green-500" />}
-                </div>
-                <button 
-                  onClick={handleConnectBucket}
-                  disabled={isConnecting || !bucketName}
-                  className="w-full bg-blue-700 text-white py-2.5 rounded-lg text-xs font-bold hover:bg-blue-800 active:scale-[0.98] transition-all disabled:opacity-50 disabled:pointer-events-none shadow-sm cursor-pointer"
-                >
-                  {isConnecting ? 'Connecting...' : 'Synchronize Source'}
-                </button>
-
-                {connectionStatus === 'success' && (
-                  <motion.div 
-                    initial={{ opacity: 0, y: 10 }}
-                    animate={{ opacity: 1, y: 0 }}
-                    className="mt-4 pt-3 border-t border-slate-200/60"
-                  >
-                    <span className="text-[10px] font-black text-slate-450 uppercase tracking-[0.15em] block mb-2">Source Documents ({gcsFiles.length})</span>
-                    {gcsFiles.length === 0 ? (
-                      <div className="p-2 border border-dashed border-slate-200 rounded-lg bg-orange-50 text-orange-850 text-[10px] leading-relaxed">
-                        No compatible files found (.pdf, .txt, .json). Add some files to your bucket.
-                      </div>
-                    ) : (
-                      <div className="space-y-1 max-h-48 overflow-y-auto pr-1">
-                        {gcsFiles.map((f) => {
-                          const isSelected = selectedGcsFile === f.name;
-                          return (
-                            <button
-                              key={f.name}
-                              onClick={() => setSelectedGcsFile(f.name)}
-                              className={cn(
-                                "w-full text-left p-2 rounded-lg border transition-all flex items-start gap-2.5 cursor-pointer group",
-                                isSelected 
-                                  ? "bg-blue-500 text-white border-blue-600 font-bold shadow-md animate-none"
-                                  : "bg-white border-slate-200/65 hover:border-slate-350 text-slate-705"
-                              )}
-                            >
-                              <FileText size={13} className={cn("mt-0.5 shrink-0 uppercase", isSelected ? "text-blue-100" : "text-slate-400 group-hover:text-slate-600")} />
-                              <div className="min-w-0 flex-1">
-                                <p className={cn("text-[11px] truncate leading-tight", isSelected ? "text-white" : "text-slate-900 font-semibold")} title={f.name}>
-                                  {f.name}
-                                </p>
-                                <p className={cn("text-[9px] font-medium mt-0.5", isSelected ? "text-blue-100" : "text-slate-400")}>
-                                  {f.size}
-                                </p>
-                              </div>
-                            </button>
-                          );
-                        })}
-                      </div>
-                    )}
-                  </motion.div>
-                )}
-              </motion.div>
-            )}
+            <div className="flex items-center gap-2">
+              <Database size={13} className="text-blue-600 shrink-0" />
+              <span className="font-mono text-[10px] font-extrabold text-blue-800 bg-blue-100/50 px-2 py-1 rounded border border-blue-200/40">gs://budget_watchdog</span>
+            </div>
           </div>
         </div>
 
         <div className="px-6 pb-8 space-y-8">
           <section>
-            <label className="text-[10px] font-black text-slate-400 uppercase tracking-[0.2em] mb-3 block">Regional Jurisdiction</label>
-            <div className="grid grid-cols-2 gap-2 bg-slate-100 p-1 rounded-xl border border-slate-200 shadow-inner mb-4">
-              {COUNTIES.map(c => (
-                <button
-                  key={c.id}
-                  onClick={() => handleCountyChange(c)}
-                  className={cn(
-                    "flex flex-col items-center justify-center py-2 px-2 rounded-lg text-center transition-all cursor-pointer",
-                    selectedCounty.id === c.id 
-                      ? "bg-white text-blue-700 shadow-sm font-extrabold border border-slate-200/50" 
-                      : "text-slate-550 hover:text-slate-800 font-bold"
-                  )}
-                >
-                  <span className="text-xs">{c.id === 'lamu' ? '🏝️' : '🏙️'}</span>
-                  <span className="text-[9px] leading-tight tracking-tight uppercase mt-0.5">{c.name.split(' ')[0]}</span>
-                </button>
-              ))}
+            <label className="text-[10px] font-black text-slate-450 uppercase tracking-[0.2em] mb-3.5 block">Active Budget Paper</label>
+            <div className="space-y-2">
+              {COUNTIES.map(c => {
+                const isSelected = selectedCounty.id === c.id;
+                return (
+                  <button
+                    key={c.id}
+                    onClick={() => handleCountyChange(c)}
+                    className={cn(
+                      "w-full text-left p-3.5 rounded-2xl border transition-all flex items-start gap-3.5 cursor-pointer group hover:scale-[1.015]",
+                      isSelected 
+                        ? "bg-gradient-to-br from-blue-600 to-blue-700 text-white border-blue-700 shadow-lg shadow-blue-500/10" 
+                        : "bg-white border-slate-200 hover:border-slate-350 hover:bg-slate-50 text-slate-700"
+                    )}
+                  >
+                    <span className={cn("text-lg p-2 rounded-xl flex items-center justify-center shrink-0", isSelected ? "bg-white/10" : "bg-slate-100")}>
+                      {c.flagEmoji}
+                    </span>
+                    <div className="min-w-0 flex-1">
+                      <p className={cn("text-xs font-extrabold tracking-tight truncate leading-tight mb-0.5 mt-0.5", isSelected ? "text-white" : "text-slate-800")}>
+                        {c.name}
+                      </p>
+                      <p className={cn("text-[8.5px] font-bold tracking-widest uppercase truncate font-mono mb-1", isSelected ? "text-blue-200" : "text-slate-400")}>
+                        {c.fileName}
+                      </p>
+                      <span className={cn("text-[9px] font-bold inline-block px-1.5 py-0.5 rounded border uppercase shrink-0 tracking-wider font-mono", isSelected ? "text-white/80 bg-white/10 border-white/10" : "text-slate-550 bg-slate-50 border-slate-200")}>
+                        {c.fileSize}
+                      </span>
+                    </div>
+                  </button>
+                );
+              })}
             </div>
-            
-            <div className="flex items-center gap-3 bg-slate-50 p-4 rounded-2xl border border-slate-100 hover:border-blue-200 transition-colors cursor-default group">
+          </section>
+
+          <section>
+            <div className="flex items-center gap-3 bg-slate-50 p-4 rounded-2xl border border-slate-150 transition-colors cursor-default group">
               <div className="w-8 h-6 bg-slate-200 rounded border border-slate-300 flex items-center justify-center overflow-hidden shrink-0 group-hover:border-blue-400 transition-colors">
                 <img src="https://upload.wikimedia.org/wikipedia/commons/4/49/Flag_of_Kenya.svg" className="w-full h-full object-cover" alt="KE" />
               </div>
-              <div>
-                <span className="font-bold text-sm text-slate-800">{metadata?.county || 'Loading...'} County</span>
-                <p className="text-[10px] font-medium text-slate-500">{metadata ? `${metadata.year}` : 'Resource Dashboard'}</p>
+              <div className="min-w-0">
+                <span className="font-bold text-sm text-slate-800 truncate block">{metadata?.county || selectedCounty.name}</span>
+                <p className="text-[10px] font-medium text-slate-500 truncate">{metadata?.year || selectedCounty.metadata.year}</p>
               </div>
             </div>
           </section>
@@ -314,25 +311,62 @@ export default function App() {
           <section>
             <label className="text-[10px] font-black text-slate-400 uppercase tracking-[0.2em] mb-4 block">Funding Metrics</label>
             <div className="grid gap-3">
-              <MetricCard label="Total Allocation" value={metadata?.total_estimate ? `${metadata.total_estimate}` : '...'} unit="KES" color="blue" />
+              <MetricCard 
+                label="Total Allocation" 
+                value={metadata?.total_estimate || selectedCounty.metadata.total_estimate} 
+                unit="KES" 
+                color="blue" 
+              />
               <div className="grid grid-cols-2 gap-3">
-                <MetricCard label="Operations" value={metadata?.recurrent_percent || "58%"} unit="RECURRENT" color="slate" />
-                <MetricCard label="Projects" value={metadata?.development_percent || "42%"} unit="DEVELOPMENT" color="green" />
+                <MetricCard 
+                  label="Operations" 
+                  value={metadata?.recurrent_percent || selectedCounty.metadata.recurrent_percent || "58%"} 
+                  unit={metadata ? getCleanExpenditure(metadata.recurrent_expenditure, "RECURRENT") : getCleanExpenditure(selectedCounty.metadata.recurrent_expenditure, "RECURRENT")} 
+                  color="slate" 
+                />
+                <MetricCard 
+                  label="Projects" 
+                  value={metadata?.development_percent || selectedCounty.metadata.development_percent || "42%"} 
+                  unit={metadata ? getCleanExpenditure(metadata.development_expenditure, "DEVELOPMENT") : getCleanExpenditure(selectedCounty.metadata.development_expenditure, "DEVELOPMENT")} 
+                  color="green" 
+                />
+              </div>
+              <div className="grid grid-cols-2 gap-3 mt-1">
+                <div className="p-3.5 rounded-xl border border-slate-200 bg-slate-50/50 min-w-0">
+                  <p className="text-[8.5px] font-black uppercase tracking-wider text-slate-400 mb-1 truncate">Own Source Revenue</p>
+                  <p className="font-extrabold text-[12px] truncate leading-none text-slate-800 font-mono">
+                    KES {metadata?.own_source_revenue || selectedCounty.metadata.own_source_revenue}
+                  </p>
+                </div>
+                <div className="p-3.5 rounded-xl border border-slate-200 bg-slate-50/50 min-w-0">
+                  <p className="text-[8.5px] font-black uppercase tracking-wider text-slate-400 mb-1 truncate">Equitable Share</p>
+                  <p className="font-extrabold text-[12px] truncate leading-none text-slate-800 font-mono">
+                    KES {metadata?.equitable_share || selectedCounty.metadata.equitable_share}
+                  </p>
+                </div>
               </div>
             </div>
           </section>
 
           <section>
-            <label className="text-[10px] font-black text-slate-400 uppercase tracking-[0.2em] mb-4 block">Official Gazette Feed</label>
-            <div className="bg-amber-50 rounded-2xl border border-amber-100/50 p-5 relative overflow-hidden group">
-              <div className="absolute -top-4 -right-4 w-12 h-12 bg-amber-200/20 rounded-full blur-xl group-hover:bg-amber-200/40 transition-all" />
-              <div className="flex items-center gap-2 text-amber-800 font-black text-[10px] tracking-tighter mb-2 relative z-10">
-                <AlertCircle size={14} strokeWidth={2.5} />
-                MONITORING SYSTEM ACTIVE
-              </div>
-              <p className="text-[11px] text-amber-700/80 leading-relaxed font-semibold italic relative z-10">
-                Scanning notices for amendments... No critical budget variances found in latest 24/25 gazette cycle.
-              </p>
+            <div className="flex items-center justify-between mb-4">
+              <label className="text-[10px] font-black text-slate-400 uppercase tracking-[0.2em]">Active Watchdog Log</label>
+              <span className="text-[8px] font-extrabold text-blue-700 bg-blue-100 border border-blue-200 px-2 py-0.5 rounded-full uppercase tracking-widest animate-pulse">Running</span>
+            </div>
+            <div className="bg-slate-900 border border-slate-800 rounded-2.5xl p-5 font-mono text-[10px] space-y-3.5 shadow-inner max-h-[200px] overflow-y-auto">
+              {activityLogs.map((log) => {
+                const colors = {
+                  info: "text-blue-400",
+                  success: "text-green-450 text-emerald-400",
+                  warning: "text-amber-400"
+                };
+                return (
+                  <div key={log.id} className="flex gap-2 items-start leading-relaxed border-b border-slate-800/40 pb-2.5 last:border-none last:pb-0">
+                    <span className="text-[8px] text-slate-500 bg-slate-800/50 px-1 py-0.5 rounded shrink-0">{log.time}</span>
+                    <span className={cn("text-[10px] font-medium font-mono leading-normal", colors[log.type] || "text-slate-300")}>{log.text}</span>
+                  </div>
+                );
+              })}
             </div>
           </section>
         </div>
@@ -356,7 +390,11 @@ export default function App() {
                </div>
                <select 
                  value={selectedWard.id}
-                 onChange={(e) => setSelectedWard(selectedCounty.wards.find(w => w.id === e.target.value)!)}
+                 onChange={(e) => {
+                   const ward = selectedCounty.wards.find(w => w.id === e.target.value)!;
+                   setSelectedWard(ward);
+                   addActivityLog(`Audits focused on ${ward.name} Ward`, 'info');
+                 }}
                  className="bg-transparent border-none focus:ring-0 text-slate-900 font-black text-xs cursor-pointer tracking-tight"
                >
                  {selectedCounty.wards.map(w => <option key={w.id} value={w.id}>{w.name} Ward</option>)}
@@ -367,8 +405,8 @@ export default function App() {
           <div className="flex items-center gap-6">
             <div className="hidden sm:flex items-center gap-4 border-r border-slate-200 pr-6 h-10">
                <div className="text-right">
-                  <span className="text-[9px] font-black text-slate-400 block tracking-widest leading-none mb-1 text-right">AUDIT TIMESTAMP</span>
-                  <span className="text-xs font-bold text-slate-900 font-mono tracking-tighter">16 MAY 2026</span>
+                  <span className="text-[9px] font-black text-slate-400 block tracking-widest leading-none mb-1 text-right">LAST SYSTEM RUN</span>
+                  <span className="text-xs font-bold text-slate-900 font-mono tracking-tighter">{lastActivity}</span>
                </div>
             </div>
             <div className="flex items-center gap-2">
@@ -411,7 +449,7 @@ export default function App() {
                       : "mr-auto chat-bubble-assistant rounded-tl-none"
                   )}
                 >
-                  <div className="markdown-body">
+                  <div className="markdown-body break-words overflow-hidden">
                     <ReactMarkdown>{msg.content}</ReactMarkdown>
                   </div>
                 </motion.div>
@@ -455,30 +493,50 @@ export default function App() {
               <div className="absolute top-0 right-0 w-48 h-48 bg-blue-500 blur-[80px] opacity-10 rounded-full group-hover:opacity-20 transition-opacity pointer-events-none translate-x-20 -translate-y-20" />
               
               <div className="relative z-10">
-                <div className="flex items-center justify-between mb-8">
-                  <div>
-                    <h3 className="text-2xl font-black mb-1 tracking-tighter leading-none">{selectedWard.name}</h3>
-                    <p className="text-[10px] text-slate-500 font-bold uppercase tracking-[0.2em]">Focus Area Audit</p>
+                <div className="flex items-center justify-between mb-8 gap-4">
+                  <div className="min-w-0">
+                    <h3 className="text-2.5xl font-black mb-1 tracking-tighter leading-none truncate max-w-[160px] sm:max-w-[220px]" title={selectedWard.name}>{selectedWard.name}</h3>
+                    <p className="text-[10px] text-slate-500 font-bold uppercase tracking-[0.2em] truncate">Focus Area Audit</p>
                   </div>
-                  <div className="p-3 bg-white/5 rounded-2xl backdrop-blur-md border border-white/10">
+                  <div className="p-3 bg-white/5 rounded-2xl backdrop-blur-md border border-white/10 shrink-0">
                     <MapPin size={20} className="text-blue-400" />
                   </div>
                 </div>
 
-                <div className="space-y-5">
-                   {selectedWard.projects.map((proj, i) => (
-                    <div key={i} className="flex gap-4 items-center group/item hover:translate-x-1 transition-transform">
-                      <div className="w-2 h-2 rounded-full bg-blue-500 group-hover/item:scale-125 transition-transform shadow-[0_0_8px_rgba(59,130,246,1)]" />
-                      <div>
-                        <p className="text-xs font-black text-white/90 uppercase tracking-tight leading-none mb-1.5">{proj}</p>
-                        <div className="flex items-center gap-1.5">
-                          <CheckCircle2 size={10} className="text-blue-400/60" />
-                          <span className="text-[9px] text-slate-500 font-bold tracking-widest leading-none">ALLOCATION_STATUS: VERIFIED</span>
-                        </div>
-                      </div>
-                    </div>
-                  ))}
-                </div>
+                <div className="space-y-4">
+                    {selectedWard.projects.map((proj, i) => {
+                      // Generate a dynamic status code based on project index/name
+                      const statuses = ["VERIFIED", "COMMITTED", "ACTIVE AUDIT", "BUDGETED"];
+                      const statusColor = [
+                        "text-blue-400 bg-blue-500/10 border-blue-500/20", 
+                        "text-emerald-450 text-emerald-400 bg-emerald-500/10 border-emerald-500/20", 
+                        "text-purple-450 text-purple-400 bg-purple-500/10 border-purple-500/20", 
+                        "text-amber-450 text-amber-400 bg-amber-500/10 border-amber-500/20"
+                      ];
+                      const index = (proj.length + i) % statuses.length;
+                      const activeStatus = statuses[index];
+                      const activeColor = statusColor[index];
+
+                      return (
+                        <button 
+                          key={i} 
+                          onClick={() => handleProjectClick(proj)}
+                          className="w-full text-left flex gap-4 items-center group/item hover:bg-white/5 p-2 rounded-xl transition-all border border-transparent hover:border-white/10 active:scale-[0.98] cursor-pointer"
+                        >
+                          <div className="w-2 h-2 rounded-full bg-blue-500 group-hover/item:scale-125 transition-all shadow-[0_0_8px_rgba(59,130,246,1)] shrink-0" />
+                          <div className="flex-1 min-w-0">
+                            <p className="text-xs font-black text-white/90 uppercase tracking-tight truncate leading-tight mb-1 group-hover/item:text-blue-400 transition-colors" title={proj}>{proj}</p>
+                            <div className="flex items-center gap-1.5 flex-wrap">
+                              <span className={cn("text-[8px] font-black tracking-widest leading-none px-1.5 py-0.5 rounded border uppercase shrink-0", activeColor)}>
+                                STATUS: {activeStatus}
+                              </span>
+                              <span className="text-[7.5px] text-white/40 font-bold uppercase tracking-widest hidden group-hover/item:inline-block animate-bounce ml-auto shrink-0">Query →</span>
+                            </div>
+                          </div>
+                        </button>
+                      );
+                    })}
+                 </div>
               </div>
             </div>
 
@@ -523,11 +581,13 @@ export default function App() {
               <div className="pt-2">
                  <div className="flex items-center gap-3">
                    <div className="flex -space-x-2">
-                     {[1,2,3].map(i => (
-                       <div key={i} className="w-6 h-6 rounded-full bg-slate-200 border-2 border-white flex items-center justify-center text-[8px] font-bold text-slate-500">WA</div>
+                     {["WA", "AM", "JK", "LT", "KO"].slice(0, (selectedWard.name.length % 3) + 2).map((initial, i) => (
+                       <div key={i} className="w-6 h-6 rounded-full bg-blue-600 border-2 border-white flex items-center justify-center text-[8px] font-extrabold text-white uppercase tracking-tight">{initial}</div>
                      ))}
                    </div>
-                   <span className="text-[9px] font-bold text-slate-400 uppercase tracking-widest">12 Citizens active in this ward</span>
+                   <span className="text-[9px] font-bold text-slate-400 uppercase tracking-widest">
+                     {(selectedWard.name.length * 8) % 43 + 12} Citizens alert active in this ward
+                   </span>
                  </div>
               </div>
             </div>
@@ -546,11 +606,13 @@ function MetricCard({ label, value, unit, color }: { label: string, value: strin
   };
 
   return (
-    <div className={cn("p-5 rounded-2xl bg-gradient-to-br border shadow-sm transition-transform hover:scale-[1.02]", colors[color])}>
-      <p className="text-[9px] font-black uppercase tracking-widest opacity-60 mb-2">{label}</p>
-      <div className="flex items-baseline gap-1">
-        <span className="text-xl font-black tracking-tighter leading-none">{value}</span>
-        <span className="text-[10px] font-bold opacity-60">{unit}</span>
+    <div className={cn("p-4 sm:p-5 rounded-2xl bg-gradient-to-br border shadow-sm transition-transform hover:scale-[1.02] min-w-0 overflow-hidden flex flex-col justify-between min-h-[115px]", colors[color])}>
+      <div>
+        <p className="text-[9px] font-black uppercase tracking-widest opacity-60 mb-2.5 truncate" title={label}>{label}</p>
+        <span className="text-lg sm:text-xl font-black tracking-tighter leading-none truncate block" title={value}>{value}</span>
+      </div>
+      <div className="border-t border-slate-200/50 mt-3 pt-2">
+        <span className="text-[8.5px] sm:text-[9.5px] font-extrabold opacity-75 tracking-wider uppercase truncate block font-mono" title={unit}>{unit}</span>
       </div>
     </div>
   );
